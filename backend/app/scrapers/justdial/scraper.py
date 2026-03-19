@@ -76,6 +76,28 @@ def _norm(s: str) -> str:
     return normalize_text(s or "").lower()
 
 
+def debug_log(message: str):
+    print(f"[JUSTDIAL] {message}")
+
+
+def save_debug_artifacts(driver, label: str):
+    try:
+        debug_dir = Path("/app/app/storage/outputs/debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        png_path = debug_dir / f"{label}_{timestamp}.png"
+        html_path = debug_dir / f"{label}_{timestamp}.html"
+
+        driver.save_screenshot(str(png_path))
+        html_path.write_text(driver.page_source or "", encoding="utf-8")
+
+        debug_log(f"Saved screenshot: {png_path}")
+        debug_log(f"Saved html dump: {html_path}")
+    except Exception as e:
+        debug_log(f"Failed to save debug artifacts for {label}: {e}")
+
+
 def normalize_keyword_typos(keyword: str) -> str:
     k = _norm(keyword)
 
@@ -411,6 +433,7 @@ def safe_find_text(parent, selectors: List[tuple]) -> str:
 
 
 def set_location_via_ui(driver, city_name: str) -> bool:
+    debug_log(f"Setting location via UI: {city_name}")
     driver.get("https://www.justdial.com")
     time.sleep(0.5)
 
@@ -452,14 +475,17 @@ def set_location_via_ui(driver, city_name: str) -> bool:
                 if suggestions:
                     suggestions[0].click()
                     time.sleep(0.45)
+                    debug_log(f"Location set via suggestion click: {city_name}")
                     return True
             except TimeoutException:
                 el.send_keys(Keys.ENTER)
                 time.sleep(0.3)
+                debug_log(f"Location set via Enter key: {city_name}")
                 return True
         except Exception:
             continue
 
+    debug_log(f"Failed to set location via UI: {city_name}")
     return False
 
 
@@ -468,17 +494,32 @@ def set_location_cookie(driver, city_name: str) -> bool:
         driver.get("https://www.justdial.com")
         time.sleep(0.25)
         driver.add_cookie({"name": "main_city", "value": city_name, "domain": ".justdial.com", "path": "/"})
+        debug_log(f"Location cookie set: {city_name}")
         return True
-    except Exception:
+    except Exception as e:
+        debug_log(f"Failed to set location cookie for {city_name}: {e}")
         return False
 
 
 def open_search_page(driver, city: str, keyword: str):
     keyword = normalize_keyword_typos(keyword)
     search_url = f"https://www.justdial.com/{city.replace(' ', '-')}/{keyword.replace(' ', '-')}"
+    debug_log(f"Opening search page: {search_url}")
     driver.get(search_url)
     WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(0.6)
+    time.sleep(1.2)
+
+    debug_log(f"Current URL after search open: {driver.current_url}")
+    debug_log(f"Page title: {driver.title}")
+
+    body_text = normalize_text(driver.find_element(By.TAG_NAME, "body").text)
+    debug_log(f"Body preview: {body_text[:500]}")
+
+    low = body_text.lower()
+    suspicious_terms = ["captcha", "verify", "blocked", "access denied", "unusual traffic", "not found"]
+    if any(term in low for term in suspicious_terms):
+        debug_log("Suspicious page detected after opening search page")
+        save_debug_artifacts(driver, "search_page_suspicious")
 
 
 def infer_city_from_text(text: str, fallback_city: str) -> str:
@@ -509,8 +550,31 @@ def collect_listing_candidates(driver, keyword: str, city: str, target: int, max
     wanted_candidates = min(max(target * 4, 12), 35)
     candidates: Dict[str, Dict[str, Any]] = {}
 
+    debug_log(
+        f"Starting candidate collection | city={city} keyword={keyword} "
+        f"target={target} max_time={max_time} wanted_candidates={wanted_candidates}"
+    )
+
+    iteration = 0
+
     while (time.time() - start) < max_time and len(candidates) < wanted_candidates and no_new < 4:
+        iteration += 1
         anchors = driver.find_elements(By.XPATH, "//a[contains(@href,'_BZDET')]")
+        debug_log(
+            f"Collection iteration={iteration} "
+            f"elapsed={round(time.time() - start, 1)}s "
+            f"anchors_found={len(anchors)} current_candidates={len(candidates)}"
+        )
+
+        if iteration == 1 and len(anchors) == 0:
+            debug_log(f"No anchors found on first iteration. URL={driver.current_url} title={driver.title}")
+            save_debug_artifacts(driver, "listing_zero_anchors")
+
+            try:
+                body_text = normalize_text(driver.find_element(By.TAG_NAME, "body").text)
+                debug_log(f"Listing body preview: {body_text[:1200]}")
+            except Exception as e:
+                debug_log(f"Failed reading body preview: {e}")
 
         for a in anchors:
             try:
@@ -588,6 +652,8 @@ def collect_listing_candidates(driver, keyword: str, city: str, target: int, max
                 continue
 
         current_count = len(candidates)
+        debug_log(f"After parsing iteration={iteration}, candidates={current_count}")
+
         if current_count == last_count:
             no_new += 1
         else:
@@ -595,6 +661,7 @@ def collect_listing_candidates(driver, keyword: str, city: str, target: int, max
         last_count = current_count
 
         if len(candidates) >= wanted_candidates:
+            debug_log("Wanted candidate count reached")
             break
 
         try:
@@ -603,6 +670,8 @@ def collect_listing_candidates(driver, keyword: str, city: str, target: int, max
                 By.XPATH,
                 "//a[contains(@rel,'next') or contains(translate(text(),'NEXT','next'),'next') or contains(@class,'next')]",
             )
+            debug_log(f"Next-page candidates found: {len(next_candidates)}")
+
             for el in next_candidates:
                 try:
                     if el.is_displayed():
@@ -617,14 +686,16 @@ def collect_listing_candidates(driver, keyword: str, city: str, target: int, max
                 except Exception:
                     driver.execute_script("arguments[0].click();", next_el)
                 time.sleep(0.8)
+                debug_log("Moved to next page")
                 continue
-        except Exception:
-            pass
+        except Exception as e:
+            debug_log(f"Next-page handling error: {e}")
 
         try:
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        except Exception:
-            pass
+            debug_log("Scrolled to page bottom")
+        except Exception as e:
+            debug_log(f"Scroll error: {e}")
         time.sleep(0.5)
 
     ranked = sorted(
@@ -632,6 +703,24 @@ def collect_listing_candidates(driver, keyword: str, city: str, target: int, max
         key=lambda x: (x["final_score"], x["rating"], x["reviews"]),
         reverse=True,
     )
+
+    debug_log(f"Candidate collection complete. Ranked candidate count={len(ranked)}")
+    if ranked:
+        debug_log(
+            "Top candidates preview: "
+            + str(
+                [
+                    {
+                        "name": x.get("business_name"),
+                        "score": x.get("final_score"),
+                        "rating": x.get("rating"),
+                        "reviews": x.get("reviews"),
+                    }
+                    for x in ranked[:5]
+                ]
+            )
+        )
+
     return ranked
 
 
@@ -675,6 +764,11 @@ def extract_profile_rows(
     shortlisted = ranked_candidates[: max(target * 5, 25)]
     total_to_process = len(shortlisted)
 
+    debug_log(
+        f"Starting profile extraction | ranked_candidates={len(ranked_candidates)} "
+        f"shortlisted={total_to_process} target={target}"
+    )
+
     if progress_callback:
         progress_callback(0, total_to_process, "Justdial scraping started")
 
@@ -685,6 +779,7 @@ def extract_profile_rows(
             break
 
         url = candidate["profile_url"]
+        debug_log(f"Opening profile {idx}/{total_to_process}: {url}")
 
         try:
             html = None
@@ -714,6 +809,7 @@ def extract_profile_rows(
                     time.sleep(0.6)
 
             if not html:
+                debug_log(f"No HTML fetched for profile: {url}")
                 if progress_callback:
                     progress_callback(idx, total_to_process, f"Justdial processed {idx}/{total_to_process}")
                 continue
@@ -851,16 +947,20 @@ def extract_profile_rows(
                     normalized_phone = ""
 
             if normalized_phone and len(normalized_phone) != 10:
+                debug_log(f"Skipping profile due to invalid phone: {url}")
                 if progress_callback:
                     progress_callback(idx, total_to_process, f"Justdial processed {idx}/{total_to_process}")
                 continue
+
             if not normalized_name:
+                debug_log(f"Skipping profile due to empty normalized name: {url}")
                 if progress_callback:
                     progress_callback(idx, total_to_process, f"Justdial processed {idx}/{total_to_process}")
                 continue
 
             row_city = infer_city_from_text(f"{parsed_city} {address} {name}", city)
             if not city_match(row_city, city):
+                debug_log(f"Skipping profile due to city mismatch: row_city={row_city}, target_city={city}, url={url}")
                 if progress_callback:
                     progress_callback(idx, total_to_process, f"Justdial processed {idx}/{total_to_process}")
                 continue
@@ -868,6 +968,7 @@ def extract_profile_rows(
             combined_text = _norm(f"{normalized_name} {normalized_company} {normalized_address} {visible_text}")
             keyword_ok = any(v in combined_text for v in keyword_variants(keyword))
             if not keyword_ok:
+                debug_log(f"Skipping profile due to keyword mismatch: {url}")
                 if progress_callback:
                     progress_callback(idx, total_to_process, f"Justdial processed {idx}/{total_to_process}")
                 continue
@@ -919,6 +1020,11 @@ def extract_profile_rows(
                 "final_score": round(computed_final_score, 2),
             }
 
+            debug_log(
+                f"Accepted row | name={normalized_name} phone={normalized_phone} "
+                f"gst={gst_found} rating={rating} reviews={reviews} final_score={row['final_score']}"
+            )
+
             if gst_found:
                 if normalized_phone and normalized_phone in seen_gst_phones:
                     if progress_callback:
@@ -948,8 +1054,8 @@ def extract_profile_rows(
                     seen_fb_names.add(normalized_name.lower())
                 fallback_rows.append(row)
 
-        except Exception:
-            pass
+        except Exception as e:
+            debug_log(f"Profile extraction error for {url}: {e}")
 
         if progress_callback:
             progress_callback(idx, total_to_process, f"Justdial processed {idx}/{total_to_process}")
@@ -983,6 +1089,11 @@ def extract_profile_rows(
         remaining = target - len(final_rows)
         final_rows.extend(fallback_rows[:remaining])
 
+    debug_log(
+        f"Profile extraction complete | gst_rows={len(gst_rows)} "
+        f"fallback_rows={len(fallback_rows)} final_rows={len(final_rows[:target])}"
+    )
+
     return final_rows[:target]
 
 
@@ -992,10 +1103,20 @@ def collect_profile_candidates(driver, city: str, keyword: str, target: int, max
     city_key = _norm(city)
     all_candidates: List[Dict[str, Any]] = []
 
+    debug_log(
+        f"Collecting profile candidates | city={city} city_key={city_key} "
+        f"keyword={keyword} target={target} max_time={max_time}"
+    )
+
     if city_key in STATES_TO_CITIES:
         cities = STATES_TO_CITIES[city_key]
         per_city_target = max(6, math.ceil(target * 1.5 / max(1, len(cities))))
         per_city_time = max(12, math.ceil(max_time / max(1, len(cities))))
+        debug_log(
+            f"State-level search detected. Expanded cities={cities} "
+            f"per_city_target={per_city_target} per_city_time={per_city_time}"
+        )
+
         for ci in cities:
             ok = set_location_via_ui(driver, ci)
             if not ok:
@@ -1003,6 +1124,7 @@ def collect_profile_candidates(driver, city: str, keyword: str, target: int, max
 
             open_search_page(driver, ci, keyword)
             city_candidates = collect_listing_candidates(driver, keyword, ci, per_city_target, per_city_time)
+            debug_log(f"City={ci} produced {len(city_candidates)} candidates")
             all_candidates.extend(city_candidates)
     else:
         ok = set_location_via_ui(driver, city)
@@ -1024,6 +1146,8 @@ def collect_profile_candidates(driver, city: str, keyword: str, target: int, max
         key=lambda x: (x["final_score"], x["rating"], x["reviews"]),
         reverse=True,
     )
+
+    debug_log(f"Dedup complete. all_candidates={len(all_candidates)} unique_ranked={len(ranked)}")
     return ranked
 
 
@@ -1038,6 +1162,11 @@ def run_justdial_scraper(
 ) -> int:
     keyword = normalize_keyword_typos(keyword)
 
+    debug_log(
+        f"Run started | keyword={keyword} city={city} max_results={max_results} "
+        f"max_time={max_time} headless={headless}"
+    )
+
     driver = create_chrome_driver(headless=headless)
     try:
         ranked_candidates = collect_profile_candidates(
@@ -1048,6 +1177,12 @@ def run_justdial_scraper(
             max_time=max_time,
         )
 
+        debug_log(f"Ranked candidates collected: {len(ranked_candidates)}")
+
+        if not ranked_candidates:
+            debug_log("No ranked candidates found. Saving diagnostics.")
+            save_debug_artifacts(driver, "no_ranked_candidates")
+
         rows = extract_profile_rows(
             driver=driver,
             ranked_candidates=ranked_candidates,
@@ -1057,6 +1192,12 @@ def run_justdial_scraper(
             headless=headless,
             progress_callback=progress_callback,
         )
+
+        debug_log(f"Final extracted rows: {len(rows)}")
+
+        if not rows:
+            debug_log("No final rows extracted. Saving diagnostics.")
+            save_debug_artifacts(driver, "no_final_rows")
 
         headers = [
             "business_name",
@@ -1082,6 +1223,8 @@ def run_justdial_scraper(
             "final_score",
         ]
         total_rows = write_csv(output_file, headers, rows)
+
+        debug_log(f"CSV written: {output_file} | total_rows={total_rows}")
 
         if progress_callback:
             shortlisted_count = len(ranked_candidates[: max(max_results * 5, 25)])
