@@ -1,5 +1,6 @@
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Callable, Optional
 from urllib.parse import urlparse
@@ -172,6 +173,28 @@ ADDRESS_SELECTORS = [
 
 def _norm(s: str) -> str:
     return normalize_text(s or "").lower()
+
+
+def debug_log(message: str):
+    print(f"[GMAPS] {message}")
+
+
+def save_debug_artifacts(driver, label: str):
+    try:
+        debug_dir = Path("/app/app/storage/outputs/debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        png_path = debug_dir / f"{label}_{timestamp}.png"
+        html_path = debug_dir / f"{label}_{timestamp}.html"
+
+        driver.save_screenshot(str(png_path))
+        html_path.write_text(driver.page_source or "", encoding="utf-8")
+
+        debug_log(f"Saved screenshot: {png_path}")
+        debug_log(f"Saved html dump: {html_path}")
+    except Exception as e:
+        debug_log(f"Failed to save debug artifacts for {label}: {e}")
 
 
 def normalize_keyword_typos(keyword: str) -> str:
@@ -552,6 +575,7 @@ def _safe_attr(parent, selectors: List[tuple], attr: str) -> str:
 def open_maps_search(driver, keyword: str, city: str):
     query = f"{keyword} in {city}"
     url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
+    debug_log(f"Opening Maps search: {url}")
     driver.get(url)
 
     WebDriverWait(driver, 20).until(
@@ -562,13 +586,40 @@ def open_maps_search(driver, keyword: str, city: str):
     )
     time.sleep(3)
 
+    debug_log(f"Current URL after open: {driver.current_url}")
+    debug_log(f"Page title: {driver.title}")
+
+    try:
+        body_text = normalize_text(driver.find_element(By.TAG_NAME, "body").text)
+        debug_log(f"Body preview: {body_text[:1000]}")
+        low = body_text.lower()
+
+        suspicious_terms = [
+            "sorry, something went wrong",
+            "unusual traffic",
+            "detected unusual traffic",
+            "sign in",
+            "before you continue",
+            "captcha",
+            "access denied",
+        ]
+        if any(term in low for term in suspicious_terms):
+            debug_log("Suspicious / blocked page detected on maps search open")
+            save_debug_artifacts(driver, "gmaps_search_suspicious")
+    except Exception as e:
+        debug_log(f"Failed to capture body preview after search open: {e}")
+
 
 def scroll_results_feed(driver, wanted_candidates: int, max_time: int):
     start = time.time()
     no_change = 0
     prev_unique_count = 0
+    iteration = 0
+
+    debug_log(f"Starting feed scroll | wanted_candidates={wanted_candidates} max_time={max_time}")
 
     while time.time() - start < max_time:
+        iteration += 1
         anchors = driver.find_elements(By.XPATH, "//a[contains(@href,'/maps/place/')]")
         unique_hrefs = set()
 
@@ -581,14 +632,31 @@ def scroll_results_feed(driver, wanted_candidates: int, max_time: int):
                 continue
 
         unique_count = len(unique_hrefs)
+        debug_log(
+            f"Scroll iteration={iteration} elapsed={round(time.time() - start, 1)}s "
+            f"anchors={len(anchors)} unique_hrefs={unique_count}"
+        )
+
+        if iteration == 1 and unique_count == 0:
+            debug_log(f"No place anchors found on first iteration. URL={driver.current_url} title={driver.title}")
+            save_debug_artifacts(driver, "gmaps_zero_anchors")
+            try:
+                body_text = normalize_text(driver.find_element(By.TAG_NAME, "body").text)
+                debug_log(f"Maps body preview: {body_text[:1200]}")
+            except Exception as e:
+                debug_log(f"Failed reading maps body preview: {e}")
+
         if unique_count >= wanted_candidates:
+            debug_log("Wanted candidates reached during scroll")
             break
 
         try:
             feed = driver.find_element(By.XPATH, "//div[@role='feed']")
             driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", feed)
+            debug_log("Scrolled results feed")
         except Exception:
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            debug_log("Scrolled window instead of feed")
 
         time.sleep(2.2)
 
@@ -600,6 +668,7 @@ def scroll_results_feed(driver, wanted_candidates: int, max_time: int):
         prev_unique_count = unique_count
 
         if no_change >= 4:
+            debug_log("Stopping scroll due to no new results")
             break
 
 
@@ -615,11 +684,18 @@ def collect_listing_candidates(
     category_norm = normalize_text(keyword)
 
     wanted_candidates = min(max(max_results * 4, 12), 40)
+    debug_log(
+        f"Collecting listing candidates | city={city} keyword={keyword} "
+        f"max_results={max_results} max_time={max_time} wanted_candidates={wanted_candidates}"
+    )
+
     scroll_results_feed(driver, wanted_candidates=wanted_candidates, max_time=max_time)
 
     candidates: Dict[str, Dict[str, Any]] = {}
 
     anchors = driver.find_elements(By.XPATH, "//a[contains(@href,'/maps/place/')]")
+    debug_log(f"Total place anchors after scroll: {len(anchors)}")
+
     for a in anchors:
         try:
             href = (a.get_attribute("href") or "").split("&authuser=")[0]
@@ -731,6 +807,23 @@ def collect_listing_candidates(
         reverse=True,
     )
 
+    debug_log(f"Candidate collection complete. Ranked candidates={len(ranked)}")
+    if ranked:
+        debug_log(
+            "Top candidates preview: "
+            + str(
+                [
+                    {
+                        "name": x.get("business_name"),
+                        "score": x.get("final_score"),
+                        "rating": x.get("rating"),
+                        "reviews": x.get("reviews"),
+                    }
+                    for x in ranked[:5]
+                ]
+            )
+        )
+
     return ranked[: max(max_results * 3, 15)]
 
 
@@ -812,6 +905,7 @@ def is_row_city_valid(row: Dict[str, Any], city: str) -> bool:
 def click_and_extract_details(driver, candidate: Dict[str, Any], city: str) -> Dict[str, Any]:
     row = dict(candidate)
     url = candidate.get("profile_url", "")
+    debug_log(f"Opening detail page: {url}")
 
     try:
         driver.get(url)
@@ -823,6 +917,9 @@ def click_and_extract_details(driver, candidate: Dict[str, Any], city: str) -> D
         )
         time.sleep(4)
 
+        debug_log(f"Detail page URL: {driver.current_url}")
+        debug_log(f"Detail page title: {driver.title}")
+
         try:
             WebDriverWait(driver, 5).until(
                 EC.presence_of_element_located((By.XPATH, "//button[contains(@data-item-id,'phone')]"))
@@ -832,6 +929,10 @@ def click_and_extract_details(driver, candidate: Dict[str, Any], city: str) -> D
 
         body_el = driver.find_element(By.TAG_NAME, "body")
         body_text = body_el.text or ""
+
+        if not body_text.strip():
+            debug_log(f"Empty body text on detail page: {url}")
+            save_debug_artifacts(driver, "gmaps_detail_empty_body")
 
         try:
             body_el.click()
@@ -846,6 +947,7 @@ def click_and_extract_details(driver, candidate: Dict[str, Any], city: str) -> D
             pass
 
         body_text = body_el.text or ""
+        debug_log(f"Detail body preview: {normalize_text(body_text)[:1200]}")
 
         business_name = _safe_text(driver, DETAIL_NAME_SELECTORS)
         if business_name:
@@ -911,7 +1013,16 @@ def click_and_extract_details(driver, candidate: Dict[str, Any], city: str) -> D
             commercial_score=int(row.get("commercial_score", 0) or 0),
             address_score=int(row.get("address_quality_score", 0) or 0),
         )
-    except Exception:
+
+        debug_log(
+            f"Accepted detail row | name={row.get('business_name')} phone={row.get('phone')} "
+            f"address={row.get('address')} rating={row.get('rating')} reviews={row.get('reviews')} "
+            f"final_score={row.get('final_score')}"
+        )
+    except Exception as e:
+        debug_log(f"Detail extraction error for {url}: {e}")
+        save_debug_artifacts(driver, "gmaps_detail_error")
+
         row["has_phone"] = "yes" if row.get("phone") else "no"
         row["has_website"] = "yes" if row.get("website") else "no"
         row["address_quality_score"] = address_quality_score(row.get("address", ""), city)
@@ -977,6 +1088,11 @@ def run_google_maps_scraper(
     city_norm = normalize_text(city)
     category_norm = normalize_text(keyword)
 
+    debug_log(
+        f"Run started | keyword={keyword} city={city} max_results={max_results} "
+        f"max_time={max_time} headless={headless}"
+    )
+
     driver = create_chrome_driver(headless=headless)
 
     try:
@@ -990,9 +1106,16 @@ def run_google_maps_scraper(
             max_time=max_time,
         )
 
+        debug_log(f"Ranked candidates collected: {len(ranked_candidates)}")
+        if not ranked_candidates:
+            debug_log("No ranked candidates found. Saving diagnostics.")
+            save_debug_artifacts(driver, "gmaps_no_ranked_candidates")
+
         detailed_rows: List[Dict[str, Any]] = []
         shortlisted = ranked_candidates[: max(max_results * 2, 12)]
         total_to_process = len(shortlisted)
+
+        debug_log(f"Shortlisted candidates for detail extraction: {total_to_process}")
 
         if progress_callback:
             progress_callback(0, total_to_process, "Google Maps scraping started")
@@ -1013,6 +1136,12 @@ def run_google_maps_scraper(
                 if is_row_city_valid(row, city):
                     if int(row.get("relevance_score", 0) or 0) >= 35:
                         detailed_rows.append(row)
+                    else:
+                        debug_log(f"Rejected row due to low relevance: {row.get('business_name')}")
+                else:
+                    debug_log(f"Rejected row due to city mismatch: {row.get('business_name')}")
+            else:
+                debug_log(f"Rejected negative business row: {row.get('business_name')}")
 
             if progress_callback:
                 progress_callback(
@@ -1021,7 +1150,10 @@ def run_google_maps_scraper(
                     f"Google Maps processed {idx}/{total_to_process}",
                 )
 
+        debug_log(f"Detailed rows before dedupe: {len(detailed_rows)}")
+
         deduped = dedupe_rows(detailed_rows)
+        debug_log(f"Rows after dedupe: {len(deduped)}")
 
         ranked_final = sorted(
             deduped,
@@ -1034,6 +1166,11 @@ def run_google_maps_scraper(
         )
 
         final_rows = ranked_final[:max_results]
+        debug_log(f"Final selected rows: {len(final_rows)}")
+
+        if not final_rows:
+            debug_log("No final rows after ranking. Saving diagnostics.")
+            save_debug_artifacts(driver, "gmaps_no_final_rows")
 
         export_rows = []
         for row in final_rows:
@@ -1086,6 +1223,7 @@ def run_google_maps_scraper(
         ]
 
         total_rows = write_csv(output_file, headers, export_rows)
+        debug_log(f"CSV written: {output_file} | total_rows={total_rows}")
 
         if progress_callback:
             progress_callback(total_to_process, total_to_process, "Google Maps scraping completed")
