@@ -1,0 +1,43 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache / compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Logs
+*.log
+logs/
+
+# Local editor / OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Generated scraper storage
+app/storage/jobs/*
+app/storage/outputs/*
+app/storage/temp/*
+
+# Keep storage directories in the repo
+!app/storage/jobs/.gitkeep
+!app/storage/outputs/.gitkeep
+!app/storage/temp/.gitkeep
