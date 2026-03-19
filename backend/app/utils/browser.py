@@ -1,10 +1,18 @@
+import os
+
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 
 
 def create_chrome_driver(headless: bool = True) -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
+
+    chrome_bin = os.getenv("CHROME_BIN")
+    chromedriver_path = os.getenv("CHROMEDRIVER_PATH")
+
+    if chrome_bin:
+        options.binary_location = chrome_bin
+
     if headless:
         options.add_argument("--headless=new")
 
@@ -14,6 +22,7 @@ def create_chrome_driver(headless: bool = True) -> webdriver.Chrome:
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-gpu")
+    options.add_argument("--remote-debugging-port=9222")
     options.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -22,8 +31,13 @@ def create_chrome_driver(headless: bool = True) -> webdriver.Chrome:
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
 
+    if chromedriver_path:
+        service = Service(chromedriver_path)
+    else:
+        service = Service()
+
     driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
+        service=service,
         options=options,
     )
 
